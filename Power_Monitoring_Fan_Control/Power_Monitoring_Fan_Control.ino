@@ -9,10 +9,11 @@
 //          无论是否有 WiFi / NTP 均可正常工作。
 //   [新增] WiFi 连接加入 30 秒超时机制，超时后以离线模式运行，
 //          40分钟定时仍然有效；获取到 WiFi 后路由器/NTP 正常工作。
+//   [新增] 集成 ADB 手机电量排队监测 & 低电量触发插座开启 40 分钟联动控制。
 //   [重构] HTML 页面拆分为独立头文件:
 //          main_html.h   — 风扇控制主页
 //          socket_html.h — 双路插座 & NAS 控制页
-//   [保留] 其余所有 v4.7.1 逻辑不变。
+//          adb_html.h    — ADB 手机电量控制页
 // =================================================================================================
 
 #include <Arduino.h>
@@ -32,6 +33,12 @@
 // 拆分出的 HTML 头文件
 #include "main_html.h"
 #include "socket_html.h"
+// 引入 ADB 模块
+#include "adb_manager.h"
+#include "adb_html.h"
+
+// 实例化 ADB 管理器
+AdbManager adbManager;
 
 // ============== 用户配置 ==============
 const char* ssid       = "yang1234";
@@ -53,7 +60,6 @@ const int I2C_SCL_PIN = 8;
 const int RELAY2_PIN  = 6;   // 插座1继电器
 const int RELAY3_PIN  = 7;   // 插座2继电器
 // --- NAS 主机电源 ---
-// ⚠️ 请确认 GPIO2 在您的板子上可用，如有冲突请修改为其他空闲引脚
 const int RELAY4_PIN  = 2;   // NAS 主机电源继电器（默认开启）
 
 // ============== PWM/LEDC 配置 (风扇) ==============
@@ -135,6 +141,42 @@ bool relay4State = false;  // NAS 主机电源
 
 
 // =======================================================
+// ============== 辅助工具函数 ==============
+// =======================================================
+
+// 解决 JSON 字符串转义
+String escapeJson(const String& s) {
+  String out = "";
+  out.reserve(s.length() + 32);
+  for (size_t i = 0; i < s.length(); i++) {
+    char c = s[i];
+    if (c == '"') out += "\\\"";
+    else if (c == '\\') out += "\\\\";
+    else if (c == '\n') out += "\\n";
+    else if (c == '\r') continue;
+    else if (c == '\t') out += "\\t";
+    else out += c;
+  }
+  return out;
+}
+
+// 获取格式化时间供 ADB 使用
+String getCurrentTimeString() {
+  if (wifiAvailable && timeClient.isTimeSet()) {
+    time_t rawtime = timeClient.getEpochTime();
+    struct tm *ptm = gmtime(&rawtime);
+    if (ptm != nullptr) {
+      char buf[20];
+      // 格式: %02d-%02d %02d:%02d:%02d
+      snprintf(buf, sizeof(buf), "%02d-%02d %02d:%02d:%02d",
+               ptm->tm_mon + 1, ptm->tm_mday, ptm->tm_hour, ptm->tm_min, ptm->tm_sec);
+      return String(buf);
+    }
+  }
+  return "--";
+}
+
+// =======================================================
 // ============== 中断 & 计算函数 ==============
 // =======================================================
 
@@ -201,11 +243,8 @@ void setSocketRelay(int internalRelayNum, bool state) {
   }
 }
 
-// NAS 继电器无调度逻辑，只能手动操作（需密码）
 void setNasRelay(bool state) {
   relay4State = state;
-  // NC接法：state=true(NAS供电) → 继电器不通电 → LOW
-  //          state=false(NAS断电) → 继电器通电   → HIGH
   digitalWrite(RELAY4_PIN, state ? LOW : HIGH);
   Serial.printf("NAS继电器 (Pin %d) [NC接法]: %s\n", RELAY4_PIN, state ? "ON(NAS供电)" : "OFF(NAS断电)");
 }
@@ -242,7 +281,6 @@ String getIPv6() {
 // ============== Web Handler 函数 ==============
 // =======================================================
 
-// ---------- 风扇页面 ----------
 void handleRoot()     { server.send(200, "text/html; charset=UTF-8", MAIN_HTML); }
 
 void handleGetData() {
@@ -351,7 +389,7 @@ void handleSetVoltageThresholds() {
 }
 
 // ---------- 插座页面 ----------
-void saveSocketSchedules();  // 前向声明
+void saveSocketSchedules();
 
 void handleSocketPage() {
   String page = FPSTR(SOCKET_HTML);
@@ -365,7 +403,6 @@ void handleGetSocketData() {
   if (wifiAvailable) timeClient.update();
   String t = wifiAvailable ? timeClient.getFormattedTime() : "--:--:--";
 
-  // 计算启动定时剩余秒数
   long bootRemainS = 0;
   if (bootTimerActive) {
     long elapsed = (long)(millis() - bootTime);
@@ -490,14 +527,11 @@ void handleApiAddTask() {
   server.send(200, "text/plain", msg);
 }
 
-// ---------- NAS 继电器控制 Handler ----------
 void handleSetNasRelay() {
-  // 必须携带 state 和 pwd 参数
   if (!server.hasArg("state") || !server.hasArg("pwd")) {
     server.send(400, "text/plain", "Bad Request: Missing state or pwd");
     return;
   }
-  // 密码校验
   if (server.arg("pwd") != String(NAS_PASSWORD)) {
     Serial.printf("[WARN] NAS继电器操作失败: 密码错误 (来自 %s)\n",
                   server.client().remoteIP().toString().c_str());
@@ -509,7 +543,6 @@ void handleSetNasRelay() {
   server.send(200, "text/plain", String("NAS relay ") + (state ? "ON" : "OFF"));
 }
 
-// ---------- 系统信息 ----------
 String getSystemInfoJSON() {
   String j = "{";
   j += "\"chip_model\":\"" + String(ESP.getChipModel()) + "\",";
@@ -759,6 +792,74 @@ void setupRoutes() {
     delay(1000);
     ESP.restart();
   }, handleUpdateUpload);
+
+  // ---------- ADB 电池与自动充电控制页面 ----------
+  server.on("/adb", HTTP_GET, []() {
+    server.send(200, "text/html; charset=UTF-8", ADB_HTML);
+  });
+
+  server.on("/getAdbData", HTTP_GET, []() {
+    String json = "{";
+    json += "\"threshold\":" + String(adbManager.getLowThreshold()) + ",";
+    json += "\"duration\":"  + String(adbManager.getChargeDuration()) + ",";
+    json += "\"interval\":"  + String(adbManager.getPollInterval()) + ",";
+    json += "\"retries\":"   + String(adbManager.getRetries()) + ",";
+    json += "\"key\":\""     + escapeJson(adbManager.getAdbKey()) + "\",";
+    json += "\"devices\":[";
+    for (size_t i = 0; i < adbManager.devices.size(); i++) {
+      const auto& d = adbManager.devices[i];
+      long rem = adbManager.getChargeRemainSeconds(d.relayNum);
+      json += "{\"ip\":\""      + d.ip + "\","
+            + "\"relay\":"      + String(d.relayNum) + ","
+            + "\"battery\":"    + String(d.battery) + ","
+            + "\"connected\":"  + String(d.connected ? "true" : "false") + ","
+            + "\"lastTime\":\"" + d.lastTime + "\","
+            + "\"msg\":\""      + d.errorMsg + "\","
+            + "\"charge_rem\":" + String(rem) + "}";
+      if (i < adbManager.devices.size() - 1) json += ",";
+    }
+    json += "]}";
+    server.send(200, "application/json", json);
+  });
+
+  server.on("/setAdbKey", HTTP_POST, []() {
+    if (server.hasArg("key")) {
+      adbManager.saveAdbKey(server.arg("key"));
+      server.send(200, "text/plain", "OK");
+    } else {
+      server.send(400, "text/plain", "Missing key");
+    }
+  });
+
+  server.on("/setAdbSettings", HTTP_POST, []() {
+    int th  = server.arg("th").toInt();
+    int dur = server.arg("dur").toInt();
+    int in  = server.arg("int").toInt();
+    int ret = server.arg("ret").toInt();
+    adbManager.saveSettings(th, in, ret, dur);
+    server.send(200, "text/plain", "OK");
+  });
+
+  server.on("/addAdbDevice", HTTP_POST, []() {
+    String ip = server.arg("ip");
+    int relay = server.arg("relay").toInt();
+    ip.trim();
+    if (ip.length() > 0) adbManager.addDevice(ip, relay);
+    server.send(200, "text/plain", "OK");
+  });
+
+  server.on("/delAdbDevice", HTTP_POST, []() {
+    String ip = server.arg("ip");
+    ip.trim();                          // 先单独修剪首尾空格
+    adbManager.removeDevice(ip);        // 再传递修剪后的变量
+    server.send(200, "text/plain", "OK");
+  });
+
+  server.on("/testAdbDevice", HTTP_GET, []() {
+    String ip = server.arg("ip");
+    adbManager.testDevice(ip);
+    server.send(200, "application/json", "{\"status\":\"ok\"}");
+  });
 }
 
 
@@ -784,7 +885,7 @@ void setup() {
 
   // NAS 继电器（默认开）
   pinMode(RELAY4_PIN, OUTPUT);
-  setNasRelay(true);  // 上电即开启
+  setNasRelay(true);
   Serial.printf("[OK] NAS继电器 (Pin %d) 已默认开启。\n", RELAY4_PIN);
 
   // PWM (风扇)
@@ -816,6 +917,9 @@ void setup() {
 
   loadSocketSchedules();
 
+  // 初始化 ADB 模块
+  adbManager.begin();
+
   // -------- 3. 启动定时: 立即开启双路插座 40 分钟（无需 WiFi）--------
   bootTime      = millis();
   bootTimerActive = true;
@@ -825,6 +929,9 @@ void setup() {
 
   // -------- 4. WiFi 连接（带超时，最多等 30 秒）--------
   WiFi.mode(WIFI_STA);
+  // 必须在 WiFi.mode 之后关闭休眠，确保稳定接收 ADB 与 Web 握手包
+  WiFi.setSleep(false);
+  
   WiFi.setHostname(deviceName);
   WiFi.enableIPv6();
   WiFi.begin(ssid, password);
@@ -892,7 +999,10 @@ void setup() {
 
 void loop() {
   server.handleClient();
-
+  
+  // 运行 ADB 排队与 40 分钟定时充电状态机
+  adbManager.loop();
+  
   // ---- 1. 启动定时检查：40分钟后关闭双路插座（millis实现，不依赖WiFi）----
   if (bootTimerActive && (millis() - bootTime >= BOOT_ON_DURATION_MS)) {
     bootTimerActive = false;

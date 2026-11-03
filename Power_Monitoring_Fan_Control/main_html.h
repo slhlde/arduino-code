@@ -26,7 +26,13 @@ const char MAIN_HTML[] PROGMEM = R"HTML(
 
 <div class="card"><h2>定时任务 (风扇)</h2><div class="timer-row"><input type="checkbox" id="t1_en"><input type="time" id="t1_time"><select id="t1_act"><option value="1">开启</option><option value="0">关闭</option></select></div><div class="timer-row"><input type="checkbox" id="t2_en"><input type="time" id="t2_time"><select id="t2_act"><option value="1">开启</option><option value="0">关闭</option></select></div><button id="saveTimerBtn" class="btn" style="background:var(--blue);margin-top:10px">保存定时设置</button></div>
 
-<div class="card"><h2>系统信息与导航</h2><div id="sys">加载中...</div><a href="/socket" class="nav-link">>> 前往双路插座 & NAS 控制页面</a></div>
+<div class="card">
+  <h2>系统信息与导航</h2>
+  <div id="sys">加载中...</div>
+  <a href="/socket" class="nav-link">&gt;&gt; 前往双路插座 &amp; NAS 控制页面</a><br>
+  <a href="/adb" class="nav-link" style="color:#38bdf8">&gt;&gt; 前往 ADB 手机电量 &amp; 自动充电页面</a>
+</div>
+
 <div class="card"><h2>固件在线更新 OTA</h2><form method="POST" action="/update" enctype="multipart/form-data"><input type="file" name="update" accept=".bin,.bin.gz"/><br/><br/><button class="btn" type="submit">上传并更新</button></form></div>
 <div class="card"><h2>七天电量统计 (Wh)</h2><div class="chart-container"><div class="chart" id="powerChart"></div><div class="chart-labels" id="powerChartLabels"></div></div></div>
 <div class="footer">

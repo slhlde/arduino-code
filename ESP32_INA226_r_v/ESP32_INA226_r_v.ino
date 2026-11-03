@@ -236,12 +236,16 @@ const unsigned long NOTIFICATION_COOLDOWN_MS = 3600000;
 unsigned long lastWarningNoticeTime = 0;
 unsigned long lastLockoutNoticeTime = 0;
 
-// --- 图表数据配置 ---
-const int DATA_POINTS = 1440;
-const int CHART_SAMPLE_STEP = 5;                 // 图表按 5 分钟取 1 点，降低首页加载和 CPU 开销
-const int CHART_POINTS = DATA_POINTS / CHART_SAMPLE_STEP; // 288 点，仍覆盖完整 24 小时
-const unsigned long DATA_INTERVAL_MS = 60000;
-int historyIndex = 0;
+// --- 图表数据配置 (直接放 RAM，仅 5.76KB，不伤 Flash) ---
+const unsigned long DATA_INTERVAL_MS = 60000; // 1分钟记录一次
+const int DATA_POINTS = 1440;                 // 1440 点 = 24 小时
+const int CHART_POINTS = 288;                 // 展示 288 点 (288 * 5分钟 = 24小时)
+const int CHART_SAMPLE_STEP = 5;
+
+static float voltageHistory[DATA_POINTS];
+static int historyCount = 0;                  // 当前已存多少有效点
+static int historyHead = 0;                   // 环形队列写入游标
+static bool historyWrapped = false;           // 是否已存满一轮(满24小时)
 
 // 曲线请求先复制历史样本，再在 RAM 中降采样生成 JSON。
 static float chartSnapshot[DATA_POINTS];
@@ -472,22 +476,15 @@ void saveEmailConfigToFile() {
 void recordVoltageHistory() {
   if (!ina226_ok) return;
   float voltage = 0.0f;
-  if (!ina226ReadBusVoltage(voltage)) {
-    sysLog(LOG_WARN, "INA226 读取总线电压失败，本次跳过历史记录");
-    return;
-  }
+  if (!ina226ReadBusVoltage(voltage)) return;
   if (voltage < 0.1f) voltage = 0.0f;
 
-  File vlogFile = LittleFS.open(VLOG_FILE_PATH, "r+");
-  if (!vlogFile) return;
-  vlogFile.seek(sizeof(int) + (historyIndex * sizeof(float)), SeekSet);
-  vlogFile.write((byte*)&voltage, sizeof(float));
-  historyIndex = (historyIndex + 1) % DATA_POINTS;
-  vlogFile.seek(0, SeekSet);
-  vlogFile.write((byte*)&historyIndex, sizeof(int));
-  vlogFile.close();
+  voltageHistory[historyHead] = voltage;
+  historyHead = (historyHead + 1) % DATA_POINTS;
+  if (historyCount < DATA_POINTS) {
+    historyCount++;
+  }
 }
-
 void setRelay(bool state) {
   // 先更新 RTC 快速备份和 GPIO，再写 NVS/LittleFS；软重启时可在 setup 最早阶段恢复。
   relayState = state;
@@ -688,77 +685,49 @@ void handleSetEmail() {
 }
 
 void handleGetChartData() {
-  // 先顺序读取到 RAM，再生成较小的 JSON；避免在 HTTP 请求中逐点 seek 文件。
-  File vlogFile = LittleFS.open(VLOG_FILE_PATH, "r");
-  if (!vlogFile || vlogFile.size() < (size_t)(sizeof(int) + DATA_POINTS * sizeof(float))) {
-    if (vlogFile) vlogFile.close();
-    server.send(503, "application/json", "{\"labels\":[],\"data\":[]}");
-    return;
-  }
-
-  int savedIndex = 0;
-  if (vlogFile.read((uint8_t*)&savedIndex, sizeof(savedIndex)) != sizeof(savedIndex)) {
-    vlogFile.close();
-    server.send(503, "application/json", "{\"labels\":[],\"data\":[]}");
-    return;
-  }
-  if (savedIndex < 0 || savedIndex >= DATA_POINTS) savedIndex = 0;
-
-  int outIndex = 0;
-  const int firstSegment = DATA_POINTS - savedIndex;
-  vlogFile.seek(sizeof(int) + (size_t)savedIndex * sizeof(float), SeekSet);
-  for (int i = 0; i < firstSegment; ++i) {
-    if (vlogFile.read((uint8_t*)&chartSnapshot[outIndex], sizeof(float)) != sizeof(float)) {
-      chartSnapshot[outIndex] = NAN;
-    }
-    ++outIndex;
-  }
-  if (savedIndex > 0) {
-    vlogFile.seek(sizeof(int), SeekSet);
-    for (int i = 0; i < savedIndex; ++i) {
-      if (vlogFile.read((uint8_t*)&chartSnapshot[outIndex], sizeof(float)) != sizeof(float)) {
-        chartSnapshot[outIndex] = NAN;
-      }
-      ++outIndex;
-    }
-  }
-  vlogFile.close();
-
-  // 1440 个点降采样到 288 个点（每 5 分钟一个），足够显示 24 小时趋势。
-  // 减小响应体，减少 String 拼接和 Wi-Fi 发送期间的 CPU 占用。
   String json;
-  json.reserve(5200);
+  json.reserve(5120);
+
+  // 1. 生成 24 小时横坐标 (共 288 点，固定步长 5 分钟，覆盖整整 24 小时)
   json += "{\"labels\":[";
   for (int i = 0; i < CHART_POINTS; ++i) {
-    if (i) json += ',';
-    const int remaining = CHART_POINTS - 1 - i;
+    if (i > 0) json += ',';
+    int minutesAgo = (CHART_POINTS - 1 - i) * 5; // 距离现在多少分钟
     if (i == CHART_POINTS - 1) {
-      json += "\"Now\"";
-    } else if (i == 0) {
-      json += "\"-24h\"";
-    } else if (remaining % 36 == 0) { // 每 3 小时一个标签：36 点 × 5 分钟
-      char label[16];
-      snprintf(label, sizeof(label), "\"-%dh\"", remaining / 12);
-      json += label;
+      json += "\"现在\"";
+    } else if (minutesAgo % 180 == 0) { // 每 3 小时标一个大刻度
+      json += "\"-" + String(minutesAgo / 60) + "h\"";
     } else {
       json += "\"\"";
     }
   }
 
+  // 2. 生成曲线数值 (从 -24h 往 当前 顺序输出)
   json += "],\"data\":[";
   for (int i = 0; i < CHART_POINTS; ++i) {
-    if (i) json += ',';
-    const int sampleIndex = (i + 1) * CHART_SAMPLE_STEP - 1;
-    const float voltage = chartSnapshot[sampleIndex];
-    if (isnan(voltage) || voltage < 0.1f) {
+    if (i > 0) json += ',';
+
+    // 计算当前这第 i 个点对应“几分钟前”
+    int minutesAgo = (CHART_POINTS - 1 - i) * 5;
+
+    // 如果设备启动时间还不足以覆盖这个历史时刻，填 null
+    if (minutesAgo >= historyCount) {
       json += "null";
     } else {
-      char value[16];
-      snprintf(value, sizeof(value), "%.2f", voltage);
-      json += value;
+      // 倒推从环形队列取出对应时刻的采样点
+      int idx = (historyHead - 1 - minutesAgo + DATA_POINTS * 2) % DATA_POINTS;
+      float v = voltageHistory[idx];
+      if (isnan(v) || v < 0.1f) {
+        json += "null";
+      } else {
+        char buf[8];
+        dtostrf(v, 1, 2, buf);
+        json += buf;
+      }
     }
   }
   json += "]}";
+
   server.send(200, "application/json", json);
 }
 
@@ -779,6 +748,8 @@ void setup() {
   }
 
   Serial.begin(115200);
+  // 初始化清空历史数组
+  for (int i = 0; i < DATA_POINTS; i++) voltageHistory[i] = NAN;
 
   relayPreferencesReady = relayPreferences.begin("relaycfg", false);
   bool wasBootedBefore = false;
@@ -810,19 +781,7 @@ void setup() {
   bool littleFsReady = LittleFS.begin(true);
   if (littleFsReady) {
     logBootReason();
-    File vlogFile = LittleFS.open(VLOG_FILE_PATH, "r+");
-    if (!vlogFile) {
-      vlogFile = LittleFS.open(VLOG_FILE_PATH, "w+");
-      if (vlogFile) {
-        int initialIndex = 0; vlogFile.write((byte*)&initialIndex, sizeof(int));
-        float nan_val = NAN;
-        for (int i = 0; i < DATA_POINTS; i++) vlogFile.write((byte*)&nan_val, sizeof(float));
-        vlogFile.close();
-      }
-    } else {
-      vlogFile.read((byte*)&historyIndex, sizeof(int));
-      vlogFile.close();
-    }
+    // 移除旧版 vlog.dat 读写，彻底改用内存环形缓冲
 
     // 兼容升级前只把继电器状态存于 /relay.txt 的设备。
     if (!savedRelayAvailable && LittleFS.exists(RELAY_STATE_PATH)) {
@@ -865,6 +824,7 @@ void setup() {
       busVoltage = initialVoltage;
       lastBusVoltage = initialVoltage;
       Serial.printf("[OK] INA226 Ready，初始电压 %.3fV\n", busVoltage);
+      recordVoltageHistory(); // 【新增此行】开机立即记录第 1 个采样点，防止打开网页图表全空
     } else {
       ina226_ok = false;
       Serial.println("[ERROR] INA226 已识别，但无法读取总线电压。");
