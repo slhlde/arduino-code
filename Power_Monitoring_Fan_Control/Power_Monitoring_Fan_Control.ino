@@ -798,7 +798,7 @@ void setupRoutes() {
     server.send(200, "text/html; charset=UTF-8", ADB_HTML);
   });
 
-  server.on("/getAdbData", HTTP_GET, []() {
+ server.on("/getAdbData", HTTP_GET, []() {
     String json = "{";
     json += "\"threshold\":" + String(adbManager.getLowThreshold()) + ",";
     json += "\"duration\":"  + String(adbManager.getChargeDuration()) + ",";
@@ -808,14 +808,24 @@ void setupRoutes() {
     json += "\"devices\":[";
     for (size_t i = 0; i < adbManager.devices.size(); i++) {
       const auto& d = adbManager.devices[i];
-      long rem = adbManager.getChargeRemainSeconds(d.relayNum);
-      json += "{\"ip\":\""      + d.ip + "\","
-            + "\"relay\":"      + String(d.relayNum) + ","
-            + "\"battery\":"    + String(d.battery) + ","
-            + "\"connected\":"  + String(d.connected ? "true" : "false") + ","
-            + "\"lastTime\":\"" + d.lastTime + "\","
-            + "\"msg\":\""      + d.errorMsg + "\","
-            + "\"charge_rem\":" + String(rem) + "}";
+      
+      bool isRelayOn = false;
+      if (d.relayTarget == "2") isRelayOn = relay2State;
+      else if (d.relayTarget == "3") isRelayOn = relay3State;
+      else if (d.relayTarget != "0") isRelayOn = d.chargeActive; // 外部插座以倒计时为准
+
+      long rem = adbManager.getDeviceRemainSeconds(d);
+
+      json += "{\"ip\":\""          + d.ip + "\","
+            + "\"relay\":\""        + escapeJson(d.relayTarget) + "\","
+            + "\"relay_on\":"       + (isRelayOn ? "true" : "false") + ","
+            + "\"adb_triggered\":"  + (d.chargeActive ? "true" : "false") + ","
+            + "\"charge_rem\":"     + String(rem) + ","
+            + "\"battery\":"        + String(d.battery) + ","
+            + "\"charging\":"       + (d.isCharging ? "true" : "false") + ","
+            + "\"connected\":"      + (d.connected ? "true" : "false") + ","
+            + "\"lastTime\":\""     + d.lastTime + "\","
+            + "\"msg\":\""          + d.errorMsg + "\"}";
       if (i < adbManager.devices.size() - 1) json += ",";
     }
     json += "]}";
@@ -842,8 +852,9 @@ void setupRoutes() {
 
   server.on("/addAdbDevice", HTTP_POST, []() {
     String ip = server.arg("ip");
-    int relay = server.arg("relay").toInt();
+    String relay = server.arg("relay"); // 接收字符串 (数字或外部IP)
     ip.trim();
+    relay.trim();
     if (ip.length() > 0) adbManager.addDevice(ip, relay);
     server.send(200, "text/plain", "OK");
   });
